@@ -177,14 +177,41 @@ struct Engine {
     GLuint gridEBO = 0;
     int gridIndexCount = 0;
 
-    int WIDTH = 1920;  // Window width (higher resolution)
-    int HEIGHT = 1080; // Window height
-    int COMPUTE_WIDTH  = 640;   // Compute resolution width (higher quality)
-    int COMPUTE_HEIGHT = 360;  // Compute resolution height
-    float width = 100000000000.0f; // Width of the viewport in meters
-    float height = 75000000000.0f; // Height of the viewport in meters
+    int WIDTH;
+    int HEIGHT;
+    float superSampleFactor;
+    int COMPUTE_WIDTH;
+    int COMPUTE_HEIGHT;
+    float width;  // Viewport width in meters
+    float height; // Viewport height in meters
+    float minSuperSampleFactor = 1.2f;
+    float maxSuperSampleFactor = 2.0f;
+    float targetFrameTime = 1.0f / 60.0f;
+    double smoothedFrameTime = targetFrameTime;
+    double lastQualityAdjust = 0.0;
+    int textureWidth = 0;
+    int textureHeight = 0;
+    bool gridDirty = true;
+    GLuint renderParamsUBO = 0;
+
+    struct RenderParams {
+        int stepsMoving;
+        int stepsStill;
+        unsigned int samplesMoving;
+        unsigned int samplesStill;
+        float superSampleFactor;
+        float padding[3];
+    } renderParams{};
     
-    Engine() {
+    Engine()
+        : WIDTH(720),
+          HEIGHT(480),
+          superSampleFactor(2.0f),               // Render internally at 4K for crisper results
+          COMPUTE_WIDTH(int(WIDTH * superSampleFactor)),
+          COMPUTE_HEIGHT(int(HEIGHT * superSampleFactor)),
+          width(100000000000.0f),
+          height(75000000000.0f) {
+        renderParams = { 60000, 120000, 1u, 4u, superSampleFactor, {0.0f, 0.0f, 0.0f} };
         if (!glfwInit()) {
             cerr << "GLFW init failed\n";
             exit(EXIT_FAILURE);
@@ -199,6 +226,7 @@ struct Engine {
             exit(EXIT_FAILURE);
         }
         glfwMakeContextCurrent(window);
+        glfwSwapInterval(1);
         glewExperimental = GL_TRUE;
         GLenum glewErr = glewInit();
         if (glewErr != GLEW_OK) {
@@ -213,6 +241,11 @@ struct Engine {
         gridShaderProgram = CreateShaderProgram("grid.vert", "grid.frag");
 
         computeProgram = CreateComputeProgram("geodesic.comp");
+        glGenBuffers(1, &renderParamsUBO);
+        glBindBuffer(GL_UNIFORM_BUFFER, renderParamsUBO);
+        glBufferData(GL_UNIFORM_BUFFER, sizeof(RenderParams), &renderParams, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 4, renderParamsUBO);
+
         glGenBuffers(1, &cameraUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
         glBufferData(GL_UNIFORM_BUFFER, 128, nullptr, GL_DYNAMIC_DRAW); // alloc ~128 bytes
@@ -237,6 +270,9 @@ struct Engine {
         auto result = QuadVAO();
         this->quadVAO = result[0];
         this->texture = result[1];
+        textureWidth = COMPUTE_WIDTH;
+        textureHeight = COMPUTE_HEIGHT;
+        updateRenderParams();
     }
     void generateGrid(const vector<ObjectData>& objects) {
         const int gridSize = 25;
@@ -308,6 +344,7 @@ struct Engine {
         gridIndexCount = indices.size();
 
         glBindVertexArray(0);
+        gridDirty = false;
     }
     void drawGrid(const mat4& viewProj) {
         glUseProgram(gridShaderProgram);
@@ -474,36 +511,26 @@ struct Engine {
         return prog;
     }
     void dispatchCompute(const Camera& cam) {
-        // determine target compute‐res (higher quality when not moving)
-        int cw = cam.moving ? COMPUTE_WIDTH / 2  : COMPUTE_WIDTH;
-        int ch = cam.moving ? COMPUTE_HEIGHT / 2 : COMPUTE_HEIGHT;
+        int cw = COMPUTE_WIDTH;
+        int ch = COMPUTE_HEIGHT;
+        ensureComputeTexture(cw, ch);
 
-        // 1) reallocate the texture if needed
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glTexImage2D(GL_TEXTURE_2D,
-                    0,                // mip
-                    GL_RGBA8,         // internal format
-                    cw,               // width
-                    ch,               // height
-                    0, GL_RGBA, 
-                    GL_UNSIGNED_BYTE, 
-                    nullptr);
-
-        // 2) bind compute program & UBOs
+        // bind compute program & UBOs
         glUseProgram(computeProgram);
         uploadCameraUBO(cam);
         uploadDiskUBO();
         uploadObjectsUBO(objects);
+        updateRenderParams();
 
-        // 3) bind it as image unit 0
+        // bind it as image unit 0
         glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
 
-        // 4) dispatch grid
+        // dispatch grid
         GLuint groupsX = (GLuint)std::ceil(cw / 16.0f);
         GLuint groupsY = (GLuint)std::ceil(ch / 16.0f);
         glDispatchCompute(groupsX, groupsY, 1);
 
-        // 5) sync
+        // sync
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     }
     void uploadCameraUBO(const Camera& cam) {
@@ -619,6 +646,57 @@ struct Engine {
         vector<GLuint> VAOtexture = {VAO, texture};
         return VAOtexture;
     }
+    void ensureComputeTexture(int width, int height) {
+        if (width == textureWidth && height == textureHeight) {
+            return;
+        }
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexImage2D(GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA8,
+                    width,
+                    height,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    nullptr);
+        textureWidth = width;
+        textureHeight = height;
+    }
+    void updateRenderParams() {
+        glBindBuffer(GL_UNIFORM_BUFFER, renderParamsUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(RenderParams), &renderParams);
+    }
+    void setSuperSampleFactor(float factor) {
+        factor = glm::clamp(factor, minSuperSampleFactor, maxSuperSampleFactor);
+        if (fabs(factor - superSampleFactor) < 0.01f) {
+            return;
+        }
+        superSampleFactor = factor;
+        COMPUTE_WIDTH = int(WIDTH * superSampleFactor);
+        COMPUTE_HEIGHT = int(HEIGHT * superSampleFactor);
+        ensureComputeTexture(COMPUTE_WIDTH, COMPUTE_HEIGHT);
+        renderParams.superSampleFactor = superSampleFactor;
+        updateRenderParams();
+        cout << "[INFO] Supersample factor: " << superSampleFactor << "x\n";
+    }
+    void updateDynamicQuality(double frameTime, bool cameraMoving) {
+        const double smoothing = 0.1;
+        smoothedFrameTime = smoothing * frameTime + (1.0 - smoothing) * smoothedFrameTime;
+        double now = glfwGetTime();
+        if (now - lastQualityAdjust < 0.5) {
+            return;
+        }
+        double downscaleThreshold = targetFrameTime * 1.3;
+        double upscaleThreshold = targetFrameTime * 0.85;
+        if (smoothedFrameTime > downscaleThreshold && superSampleFactor > minSuperSampleFactor) {
+            setSuperSampleFactor(superSampleFactor - 0.1f);
+            lastQualityAdjust = now;
+        } else if (!cameraMoving && smoothedFrameTime < upscaleThreshold && superSampleFactor < maxSuperSampleFactor) {
+            setSuperSampleFactor(superSampleFactor + 0.05f);
+            lastQualityAdjust = now;
+        }
+    }
     void renderScene() {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glUseProgram(shaderProgram);
@@ -660,13 +738,11 @@ void setupCameraCallbacks(GLFWwindow* window) {
 // -- MAIN -- //
 int main() {
     setupCameraCallbacks(engine.window);
-    vector<unsigned char> pixels(engine.WIDTH * engine.HEIGHT * 3);
 
     auto t0 = Clock::now();
     lastPrintTime = chrono::duration<double>(t0.time_since_epoch()).count();
 
     double lastTime = glfwGetTime();
-    int   renderW  = 800, renderH = 600, numSteps = 80000;
     while (!glfwWindowShouldClose(engine.window)) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);  // optional, but good practice
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -676,6 +752,7 @@ int main() {
         lastTime     = now;
 
         // Gravity
+        bool objectsMoved = false;
         for (auto& obj : objects) {
             for (auto& obj2 : objects) {
                 if (&obj == &obj2) continue; // skip self-interaction
@@ -698,20 +775,24 @@ int main() {
                             obj.posRadius.x += obj.velocity.x;
                             obj.posRadius.y += obj.velocity.y;
                             obj.posRadius.z += obj.velocity.z;
-                            cout << "velocity: " <<obj.velocity.x<<", " <<obj.velocity.y<<", " <<obj.velocity.z<<endl;
+                            objectsMoved = true;
                         }
                     }
             }
+        }
+        if (objectsMoved) {
+            engine.gridDirty = true;
         }
 
 
 
         // ---------- GRID ------------- //
-        // 2) rebuild grid mesh on CPU
-        engine.generateGrid(objects);
+        if (engine.gridDirty) {
+            engine.generateGrid(objects);
+        }
         // 5) overlay the bent grid
         mat4 view = lookAt(camera.position(), camera.target, vec3(0,1,0));
-        mat4 proj = perspective(radians(60.0f), float(engine.COMPUTE_WIDTH)/engine.COMPUTE_HEIGHT, 1e9f, 1e14f);
+        mat4 proj = perspective(radians(60.0f), float(engine.COMPUTE_WIDTH)/float(engine.COMPUTE_HEIGHT), 1e9f, 1e14f);
         mat4 viewProj = proj * view;
         engine.drawGrid(viewProj);
 
@@ -724,6 +805,8 @@ int main() {
         // 6) present to screen
         glfwSwapBuffers(engine.window);
         glfwPollEvents();
+
+        engine.updateDynamicQuality(dt, camera.moving);
     }
 
     glfwDestroyWindow(engine.window);
