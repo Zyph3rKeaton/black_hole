@@ -18,6 +18,10 @@ layout(std140, binding = 2) uniform Disk {
     float disk_r2;
     float disk_num;
     float thickness;
+    float disk_inner_temp;  // Temperature at inner edge (Kelvin)
+    float disk_outer_temp;  // Temperature at outer edge (Kelvin)
+    float disk_angular_velocity; // Angular velocity factor
+    float disk_time;        // Animation time
 };
 
 layout(std140, binding = 3) uniform Objects {
@@ -30,6 +34,11 @@ layout(std140, binding = 3) uniform Objects {
 const float SagA_rs = 1.269e10;
 const float D_LAMBDA = 1e7;
 const double ESCAPE_R = 1e30;
+const float C = 299792458.0; // Speed of light
+const float K_B = 1.380649e-23; // Boltzmann constant
+const float PLANCK = 6.62607015e-34;
+const float C1 = 2.0 * 3.14159265359 * PLANCK * C * C;
+const float C2 = PLANCK * C / K_B;
 
 // Globals to store hit info
 vec4 objectColor = vec4(0.0);
@@ -114,9 +123,160 @@ bool crossesEquatorialPlane(vec3 oldPos, vec3 newPos) {
     return crossed && (r >= disk_r1 && r <= disk_r2);
 }
 
+// Convert temperature (Kelvin) to RGB color (blackbody radiation)
+vec3 temperatureToColor(float temp) {
+    if (temp < 1000.0) temp = 1000.0;
+    if (temp > 40000.0) temp = 40000.0;
+    
+    // Approximate blackbody color using a simplified model
+    float t = temp / 1000.0;
+    
+    float r, g, b;
+    
+    // Red component
+    if (t < 66.0) {
+        r = 255.0;
+    } else {
+        r = t - 60.0;
+        r = 329.698727446 * pow(r, -0.1332047592);
+        r = clamp(r, 0.0, 255.0);
+    }
+    
+    // Green component
+    if (t < 66.0) {
+        g = t;
+        g = 99.4708025861 * log(g) - 161.1195681661;
+        g = clamp(g, 0.0, 255.0);
+    } else {
+        g = t - 60.0;
+        g = 288.1221695283 * pow(g, -0.0755148492);
+        g = clamp(g, 0.0, 255.0);
+    }
+    
+    // Blue component
+    if (t >= 66.0) {
+        b = 255.0;
+    } else {
+        if (t <= 19.0) {
+            b = 0.0;
+        } else {
+            b = t - 10.0;
+            b = 138.5177312231 * log(b) - 305.0447927307;
+            b = clamp(b, 0.0, 255.0);
+        }
+    }
+    
+    return vec3(r, g, b) / 255.0;
+}
+
+// Calculate relativistic Doppler beaming factor
+float dopplerBeaming(vec3 diskPos, vec3 rayDir, vec3 camPos) {
+    // Calculate disk velocity (tangential, orbiting around black hole)
+    vec3 toCenter = normalize(-diskPos);
+    vec3 tangent = vec3(-toCenter.z, 0.0, toCenter.x); // Perpendicular in xz plane
+    
+    // Angular velocity decreases with radius (Keplerian orbit)
+    // v = sqrt(GM/r) for circular orbits
+    float r = length(vec2(diskPos.x, diskPos.z));
+    if (r < disk_r1) r = disk_r1; // Clamp to disk bounds
+    
+    // Calculate orbital velocity (non-relativistic approximation)
+    // v = sqrt(G*M/r), but we'll use a scaled version
+    float v_orbital = disk_angular_velocity * sqrt(SagA_rs / r);
+    vec3 velocity = tangent * v_orbital;
+    
+    // Calculate relative velocity along ray direction to camera
+    vec3 toCamera = normalize(camPos - diskPos);
+    float v_parallel = dot(velocity, toCamera);
+    
+    // Relativistic Doppler factor: sqrt((1 + v/c) / (1 - v/c))
+    // For v << c, this approximates to 1 + v/c
+    float beta = v_parallel / C;
+    
+    // Clamp beta to avoid numerical issues
+    beta = clamp(beta, -0.3, 0.3);
+    
+    // Relativistic Doppler beaming
+    float doppler = sqrt((1.0 + beta) / (1.0 - beta));
+    
+    // Clamp to reasonable values and enhance effect
+    doppler = clamp(doppler, 0.5, 3.0);
+    
+    // Boost the effect for more visible beaming
+    return mix(1.0, doppler, 0.7);
+}
+
+// Get disk temperature at radius r (inner hotter, outer cooler)
+float getDiskTemperature(float r) {
+    float t = (r - disk_r1) / (disk_r2 - disk_r1);
+    t = clamp(t, 0.0, 1.0);
+    // Exponential falloff for more realistic temperature gradient
+    t = pow(1.0 - t, 1.5);
+    return mix(disk_outer_temp, disk_inner_temp, t);
+}
+
+// Calculate disk emission with multiple rings and structure
+vec4 getDiskColor(vec3 diskPos, vec3 rayDir, vec3 camPos) {
+    float r = length(vec2(diskPos.x, diskPos.z));
+    float normalizedR = (r - disk_r1) / (disk_r2 - disk_r1);
+    
+    // Get temperature at this radius
+    float temp = getDiskTemperature(r);
+    
+    // Base color from temperature
+    vec3 baseColor = temperatureToColor(temp);
+    
+    // Add structure: multiple rings with varying intensity
+    float ringPattern = sin(normalizedR * 15.0 + disk_time * 0.5) * 0.5 + 0.5;
+    ringPattern = pow(ringPattern, 0.7);
+    
+    // Inner region: bright white/blue (hottest)
+    if (normalizedR < 0.15) {
+        baseColor = mix(vec3(0.8, 0.9, 1.0), baseColor, normalizedR / 0.15);
+    }
+    
+    // Middle region: orange/yellow transition
+    if (normalizedR > 0.15 && normalizedR < 0.5) {
+        float t = (normalizedR - 0.15) / 0.35;
+        baseColor = mix(baseColor, vec3(1.0, 0.6, 0.2), t * 0.5);
+    }
+    
+    // Outer region: red (coolest)
+    if (normalizedR > 0.7) {
+        baseColor = mix(baseColor, vec3(1.0, 0.3, 0.1), (normalizedR - 0.7) / 0.3);
+    }
+    
+    // Apply Doppler beaming (approaching side brighter)
+    float doppler = dopplerBeaming(diskPos, rayDir, camPos);
+    baseColor *= doppler;
+    
+    // Add radial brightness falloff
+    float brightness = 1.0 - normalizedR * 0.3;
+    brightness = pow(brightness, 0.8);
+    
+    // Apply ring pattern
+    brightness *= (0.7 + ringPattern * 0.3);
+    
+    // Calculate intensity based on viewing angle
+    vec3 diskNormal = vec3(0.0, 1.0, 0.0);
+    vec3 toCamera = normalize(camPos - diskPos);
+    float viewAngle = abs(dot(diskNormal, toCamera));
+    brightness *= 0.3 + viewAngle * 0.7; // Edge-on is dimmer
+    
+    // Add glow effect for inner regions
+    if (normalizedR < 0.3) {
+        float glow = 1.0 - normalizedR / 0.3;
+        baseColor += vec3(0.2, 0.3, 0.4) * glow * 0.5;
+    }
+    
+    return vec4(baseColor * brightness, 1.0);
+}
+
 void main() {
-    int WIDTH  = cam.moving ? 200 : 200;
-    int HEIGHT = cam.moving ? 150 : 150;
+    // Get actual image dimensions
+    ivec2 imgSize = imageSize(outImage);
+    int WIDTH  = imgSize.x;
+    int HEIGHT = imgSize.y;
 
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     if (pix.x >= WIDTH || pix.y >= HEIGHT) return;
@@ -132,46 +292,111 @@ void main() {
     float lambda = 0.0;
 
     bool hitBlackHole = false;
-    bool hitDisk      = false;
     bool hitObject    = false;
+    
+    // Track multiple disk crossings for Einstein rings
+    int diskHits = 0;
+    vec4 diskAccum = vec4(0.0);
+    float diskWeight = 0.0;
+    
+    // Starfield background color (dark space with subtle stars)
+    vec3 background = vec3(0.01, 0.01, 0.02);
+    
+    // Add subtle starfield
+    vec2 screenUV = vec2(pix) / vec2(WIDTH, HEIGHT);
+    float starField = 0.0;
+    for (int i = 0; i < 3; i++) {
+        vec2 starPos = vec2(
+            fract(sin(dot(screenUV + vec2(i * 0.1), vec2(12.9898, 78.233))) * 43758.5453),
+            fract(sin(dot(screenUV + vec2(i * 0.1), vec2(23.1407, 2.665))) * 43758.5453)
+        );
+        float dist = length(starPos - screenUV);
+        starField += smoothstep(0.02, 0.0, dist) * 0.3;
+    }
+    background += vec3(starField);
 
-    int steps = cam.moving ? 60000 : 60000;
+    int steps = cam.moving ? 60000 : 80000;
 
     for (int i = 0; i < steps; ++i) {
-        if (intercept(ray, SagA_rs)) { hitBlackHole = true; break; }
+        if (intercept(ray, SagA_rs)) { 
+            hitBlackHole = true; 
+            break; 
+        }
+        
+        vec3 oldPos = vec3(ray.x, ray.y, ray.z);
         rk4Step(ray, D_LAMBDA);
         lambda += D_LAMBDA;
 
         vec3 newPos = vec3(ray.x, ray.y, ray.z);
-        if (crossesEquatorialPlane(prevPos, newPos)) { hitDisk = true; break; }
-        if (interceptObject(ray)) { hitObject = true; break; }
+        
+        // Check for disk crossing (can happen multiple times due to lensing)
+        if (crossesEquatorialPlane(prevPos, newPos)) {
+            vec3 diskPos = mix(prevPos, newPos, 0.5);
+            vec4 diskColor = getDiskColor(diskPos, normalize(newPos - prevPos), cam.camPos);
+            
+            // Accumulate disk contributions (for multiple rings)
+            float weight = 1.0 / (1.0 + float(diskHits) * 0.3); // Diminish with each ring
+            diskAccum += diskColor * weight;
+            diskWeight += weight;
+            diskHits++;
+            
+            // Limit number of rings to prevent over-brightening
+            if (diskHits >= 5) break;
+        }
+        
+        if (interceptObject(ray)) { 
+            hitObject = true; 
+            break; 
+        }
         prevPos = newPos;
         if (ray.r > ESCAPE_R) break;
     }
 
-    if (hitDisk) {
-        double r = length(vec3(ray.x, ray.y, ray.z)) / disk_r2;
-        vec3 diskColor = vec3(1.0, r, 0.2);
-        //r = 1.0 - abs(r - 0.5) * 2.0;
-        color = vec4(diskColor, r);
-
-    } else if (hitBlackHole) {
+    // Combine all effects
+    if (hitBlackHole) {
+        // Pure black for event horizon, with subtle glow at edge
         color = vec4(0.0, 0.0, 0.0, 1.0);
-
+        
+    } else if (diskHits > 0) {
+        // Average accumulated disk contributions
+        vec4 diskColor = diskAccum / max(diskWeight, 1.0);
+        
+        // Add glow/bloom effect for inner rings
+        float glow = min(float(diskHits) / 3.0, 1.0);
+        diskColor.rgb += vec3(0.1, 0.15, 0.2) * glow;
+        
+        // Enhance contrast and saturation
+        diskColor.rgb = pow(diskColor.rgb, vec3(0.9)); // Slight gamma correction
+        diskColor.rgb *= 1.2; // Brightness boost
+        
+        color = diskColor;
+        
     } else if (hitObject) {
-        // Compute shading
+        // Compute shading with disk illumination
         vec3 P = vec3(ray.x, ray.y, ray.z);
         vec3 N = normalize(P - hitCenter);
         vec3 V = normalize(cam.camPos - P);
-        float ambient = 0.1;
+        
+        // Ambient lighting from disk
+        float ambient = 0.15;
         float diff = max(dot(N, V), 0.0);
         float intensity = ambient + (1.0 - ambient) * diff;
-        vec3 shaded = objectColor.rgb * intensity;
+        
+        // Add subtle disk glow
+        vec3 diskGlow = vec3(0.05, 0.08, 0.1);
+        vec3 shaded = objectColor.rgb * intensity + diskGlow;
         color = vec4(shaded, objectColor.a);
 
     } else {
-        color = vec4(0.0);
+        // Background with starfield
+        color = vec4(background, 1.0);
     }
+    
+    // Final color grading for cinematic look
+    // Slight desaturation and contrast boost
+    float luminance = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+    color.rgb = mix(vec3(luminance), color.rgb, 0.85);
+    color.rgb = pow(color.rgb, vec3(0.95)); // Slight contrast
 
     imageStore(outImage, pix, color);
 }

@@ -1,3 +1,14 @@
+/*
+ * Interstellar-Style Black Hole Simulation
+ * 
+ * Enhanced features inspired by the movie "Interstellar":
+ * - Realistic accretion disk with temperature-based color gradients (hot inner = blue/white, cool outer = red/orange)
+ * - Relativistic Doppler beaming (approaching side of disk appears brighter)
+ * - Multiple Einstein rings from gravitational lensing
+ * - Starfield background
+ * - Enhanced visual quality with proper color grading
+ * - Higher resolution rendering
+ */
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
@@ -166,10 +177,10 @@ struct Engine {
     GLuint gridEBO = 0;
     int gridIndexCount = 0;
 
-    int WIDTH = 800;  // Window width
-    int HEIGHT = 600; // Window height
-    int COMPUTE_WIDTH  = 200;   // Compute resolution width
-    int COMPUTE_HEIGHT = 150;  // Compute resolution height
+    int WIDTH = 1920;  // Window width (higher resolution)
+    int HEIGHT = 1080; // Window height
+    int COMPUTE_WIDTH  = 640;   // Compute resolution width (higher quality)
+    int COMPUTE_HEIGHT = 360;  // Compute resolution height
     float width = 100000000000.0f; // Width of the viewport in meters
     float height = 75000000000.0f; // Height of the viewport in meters
     
@@ -181,7 +192,7 @@ struct Engine {
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-        window = glfwCreateWindow(WIDTH, HEIGHT, "Black Hole", nullptr, nullptr);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "Black Hole - Interstellar Style", nullptr, nullptr);
         if (!window) {
             cerr << "Failed to create GLFW window\n";
             glfwTerminate();
@@ -209,7 +220,8 @@ struct Engine {
 
         glGenBuffers(1, &diskUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
-        glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 4, nullptr, GL_DYNAMIC_DRAW); // 3 values + 1 padding
+        // Updated size: r1, r2, num, thickness, inner_temp, outer_temp, angular_velocity, time
+        glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 8, nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_UNIFORM_BUFFER, 2, diskUBO); // binding = 2 matches compute shader
 
         glGenBuffers(1, &objectsUBO);
@@ -462,9 +474,9 @@ struct Engine {
         return prog;
     }
     void dispatchCompute(const Camera& cam) {
-        // determine target compute‐res
-        int cw = cam.moving ? COMPUTE_WIDTH  : 200;
-        int ch = cam.moving ? COMPUTE_HEIGHT : 150;
+        // determine target compute‐res (higher quality when not moving)
+        int cw = cam.moving ? COMPUTE_WIDTH / 2  : COMPUTE_WIDTH;
+        int ch = cam.moving ? COMPUTE_HEIGHT / 2 : COMPUTE_HEIGHT;
 
         // 1) reallocate the texture if needed
         glBindTexture(GL_TEXTURE_2D, texture);
@@ -544,12 +556,17 @@ struct Engine {
         glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(data), &data);
     }
     void uploadDiskUBO() {
-        // disk
+        // disk parameters for Interstellar-style accretion disk
         float r1 = SagA.r_s * 2.2f;    // inner radius just outside the event horizon
-        float r2 = SagA.r_s * 5.2f;   // outer radius of the disk
-        float num = 2.0;               // number of rays
-        float thickness = 1e9f;          // padding for std140 alignment
-        float diskData[4] = { r1, r2, num, thickness };
+        float r2 = SagA.r_s * 8.0f;    // outer radius of the disk (larger for more dramatic effect)
+        float num = 2.0;               // number of rays (legacy, kept for compatibility)
+        float thickness = 1e9f;         // disk thickness
+        float inner_temp = 15000.0f;   // Inner disk temperature (Kelvin) - hot blue/white
+        float outer_temp = 3000.0f;    // Outer disk temperature (Kelvin) - cool red/orange
+        float angular_velocity = 1e-4f; // Angular velocity factor for Doppler beaming
+        float time = static_cast<float>(glfwGetTime()); // Animation time
+        
+        float diskData[8] = { r1, r2, num, thickness, inner_temp, outer_temp, angular_velocity, time };
 
         glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(diskData), diskData);
@@ -583,8 +600,12 @@ struct Engine {
         GLuint texture;
         glGenTextures(1, &texture);
         glBindTexture(GL_TEXTURE_2D, texture);
+        // Use linear filtering for smooth upscaling
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // Clamp to edge to avoid wrapping artifacts
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindTexture(GL_TEXTURE_2D, texture);
         glTexImage2D(GL_TEXTURE_2D,
                     0,             // mip
@@ -696,6 +717,7 @@ int main() {
 
         // ---------- RUN RAYTRACER ------------- //
         glViewport(0, 0, engine.WIDTH, engine.HEIGHT);
+        engine.uploadDiskUBO(); // Update disk parameters (including time) every frame
         engine.dispatchCompute(camera);
         engine.drawFullScreenQuad();
 
